@@ -126,80 +126,112 @@ int16_t DecodeRice(BitReader& reader, int k) {
     return ZigZagDecode(mapped);
 }
 
-// Helper to handle the prediction
-std::vector<int16_t> CalculateResiduals(const std::vector<int16_t>& rawAudio) {
+// Helper to handle the prediction (Now Channel-Aware)
+std::vector<int16_t> CalculateResiduals(const std::vector<int16_t>& rawAudio, int numChannels) {
     std::vector<int16_t> residuals;
     residuals.reserve(rawAudio.size());
 
-    int16_t previousSample = 0;
     for (size_t i = 0; i < rawAudio.size(); ++i) {
         int16_t currentSample = rawAudio[i];
+        int16_t previousSample = 0;
+
+        // Look back by the number of channels
+        if (i >= (size_t)numChannels) {
+            previousSample = rawAudio[i - numChannels];
+        }
         
-        // 1st-Order Prediction: We guess the current sample is exactly the same as the previous one.
-        // The "residual" is the difference between our guess and reality.
-        int16_t residual = currentSample - previousSample;
-        
-        residuals.push_back(residual);
-        previousSample = currentSample; // Update previous for the next loop
+        residuals.push_back(currentSample - previousSample);
     }
     return residuals;
 }
 
-// Helper to reverse the prediction
-std::vector<int16_t> ReconstructAudio(const std::vector<int16_t>& residuals) {
+// Helper to reverse the prediction (Now Channel-Aware)
+std::vector<int16_t> ReconstructAudio(const std::vector<int16_t>& residuals, int numChannels) {
     std::vector<int16_t> reconstructed;
     reconstructed.reserve(residuals.size());
 
-    int16_t previousSample = 0;
     for (size_t i = 0; i < residuals.size(); ++i) {
-        // To rebuild, we add the residual back to our last known sample
-        int16_t currentSample = previousSample + residuals[i];
+        int16_t previousSample = 0;
         
-        reconstructed.push_back(currentSample);
-        previousSample = currentSample;
+        // Look back by the number of channels in the RECONSTRUCTED array
+        if (i >= (size_t)numChannels) {
+            previousSample = reconstructed[i - numChannels];
+        }
+        
+        reconstructed.push_back(residuals[i] + previousSample);
     }
     return reconstructed;
 }
 
+// --- Optimal K Finder ---
+int FindOptimalK(const std::vector<int16_t>& residuals) {
+    int bestK = 8;
+    uint64_t minBits = UINT64_MAX; // Start with the maximum possible number
 
-CompressionResult CompressAudio(const std::vector<int16_t>& rawAudio) {
+    // Test K values between 4 and 14 (standard range for audio)
+    for (int k = 4; k <= 14; ++k) {
+        uint64_t totalBits = 0;
+        
+        for (int16_t res : residuals) {
+            uint16_t mapped = ZigZagEncode(res);
+            uint16_t q = mapped >> k;
+            
+            // Unary length is 'q' 1s + one '0'. Binary remainder is 'k' bits.
+            totalBits += (q + 1) + k; 
+        }
+        
+        // If this K takes fewer bits, it's our new winner
+        if (totalBits < minBits) {
+            minBits = totalBits;
+            bestK = k;
+        }
+    }
+    
+    return bestK;
+}
+
+CompressionResult CompressAudio(const std::vector<int16_t>& rawAudio, int numChannels) {
     auto start = std::chrono::high_resolution_clock::now();
 
     // 1. Prediction Phase
-    std::vector<int16_t> residuals = CalculateResiduals(rawAudio);
+    std::vector<int16_t> residuals = CalculateResiduals(rawAudio, numChannels);
 
-    // 2. Entropy Phase (Rice Coding)
+    // 2. Find the mathematically perfect K for this specific audio
+    int optimalK = FindOptimalK(residuals);
+
+    // 3. Entropy Phase
     BitWriter writer;
-    int k = 8; // Standard starting K-value for audio
+    
+    // IMPORTANT: Write the winning K into the first 8 bits of the file!
+    // This acts as a mini-header so the decoder knows how to read it.
+    writer.WriteBits(optimalK, 8); 
 
     for (size_t i = 0; i < residuals.size(); ++i) {
-        EncodeRice(writer, residuals[i], k);
+        EncodeRice(writer, residuals[i], optimalK);
     }
     
-    writer.Flush(); // Don't forget the leftover bits!
+    writer.Flush();
 
     auto stop = std::chrono::high_resolution_clock::now();
     double runtime = std::chrono::duration<double, std::milli>(stop - start).count();
 
-    // Return our tightly packed bitstream
     return {writer.buffer, runtime};
 }
 
 
-std::vector<int16_t> DecompressAudio(const std::vector<uint8_t>& compressedData, size_t expectedSamples) {
+std::vector<int16_t> DecompressAudio(const std::vector<uint8_t>& compressedData, size_t expectedSamples, int numChannels) {
     BitReader reader(compressedData);
     std::vector<int16_t> decodedResiduals;
     decodedResiduals.reserve(expectedSamples);
 
-    int k = 8; // Must match the k-value used in CompressAudio
-
+    int optimalK = reader.ReadBits(8);
     // Decode exactly the number of samples we expect
     for (size_t i = 0; i < expectedSamples; ++i) {
-        decodedResiduals.push_back(DecodeRice(reader, k));
+        decodedResiduals.push_back(DecodeRice(reader, optimalK));
     }
 
     // Run the inverse prediction to get the original PCM back
-    return ReconstructAudio(decodedResiduals);
+    return ReconstructAudio(decodedResiduals, numChannels);
 }
 
 

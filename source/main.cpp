@@ -74,6 +74,10 @@ int main(int, char**) {
         return -1;
     }
 
+    ma_audio_buffer decompressedBuffer;
+    ma_sound decompressedSound;
+    bool isDecompressedSoundLoaded = false;
+
     ma_sound originalSound;
     bool isOriginalSoundLoaded = false;
     // 4. Main rendering loop
@@ -144,11 +148,11 @@ int main(int, char**) {
         if (ImGui::Button("Compress & Verify Live", ImVec2(200, 30))) {
             if (!loadedAudioData.empty()) {
                 // 1. Run the compression engine
-                CompressionResult result = CompressAudio(loadedAudioData);
+                CompressionResult result = CompressAudio(loadedAudioData, audioChannels);
                 calculatedRuntime = result.runtimeMs;
 
-                // 2. Immediately decompress to test it
-                decompressedAudioData = DecompressAudio(result.compressedData, loadedAudioData.size());
+                // 2. Immediately decompress to test it 
+                decompressedAudioData = DecompressAudio(result.compressedData, loadedAudioData.size(), audioChannels);
                 // 3. Verify bit-perfect reconstruction
                 bool isLossless = VerifyBitPerfect(loadedAudioData, decompressedAudioData);
                 verificationStatus = isLossless ? "PASS (Bit-Perfect)" : "FAIL";
@@ -162,6 +166,35 @@ int main(int, char**) {
                 }
             } else {
                 verificationStatus = "ERROR: Load a WAV first!";
+            }
+
+            // --- NEW: Load Decompressed Data into Audio Engine ---
+            
+            // Clean up old sound if you click the button multiple times
+            if (isDecompressedSoundLoaded) {
+                ma_sound_uninit(&decompressedSound);
+                ma_audio_buffer_uninit(&decompressedBuffer);
+                isDecompressedSoundLoaded = false;
+            }
+
+            // Tell miniaudio about our std::vector's raw memory
+            ma_audio_buffer_config config = ma_audio_buffer_config_init(
+                ma_format_s16,                                        // 16-bit PCM
+                audioChannels,                                        // Stereo/Mono
+                decompressedAudioData.size() / audioChannels,         // Total frames
+                decompressedAudioData.data(),                         // Pointer to vector
+                NULL
+            );
+
+            config.sampleRate = audioSampleRate;
+            
+            ma_audio_buffer_init(&config, &decompressedBuffer);
+            
+            // Hook the buffer to a sound object so we can play it
+            if (ma_sound_init_from_data_source(&engine, &decompressedBuffer, 0, NULL, &decompressedSound) == MA_SUCCESS) {
+                isDecompressedSoundLoaded = true;
+            } else {
+                verificationStatus = "ERROR: Failed to load decompressed audio into engine!";
             }
         }
 
@@ -209,8 +242,23 @@ int main(int, char**) {
         
         ImGui::SameLine();
         
-        if (ImGui::Button("Play Decompressed", ImVec2(140, 0))) {
-            // We will hook this up to our decompressed memory buffer later!
+        // Dynamic button label based on playing state
+        const char* decompBtnText = (isDecompressedSoundLoaded && ma_sound_is_playing(&decompressedSound)) ? "Stop Decompressed" : "Play Decompressed";
+        if (ImGui::Button(decompBtnText, ImVec2(140, 0))) {
+            if (isDecompressedSoundLoaded) {
+                if (ma_sound_is_playing(&decompressedSound)) {
+                    // Stop and rewind
+                    ma_sound_stop(&decompressedSound);
+                    ma_sound_seek_to_pcm_frame(&decompressedSound, 0); 
+                } else {
+                    // If original is playing, stop it so they don't overlap
+                    if (isOriginalSoundLoaded && ma_sound_is_playing(&originalSound)) {
+                        ma_sound_stop(&originalSound);
+                        ma_sound_seek_to_pcm_frame(&originalSound, 0);
+                    }
+                    ma_sound_start(&decompressedSound);
+                }
+            }
         }
 
         ImGui::End();
@@ -229,9 +277,15 @@ int main(int, char**) {
     }
 
     // 5. Cleanup
+    // --- Miniaudio Cleanup ---
     if (isOriginalSoundLoaded) {
         ma_sound_uninit(&originalSound);
     }
+    if (isDecompressedSoundLoaded) {
+        ma_sound_uninit(&decompressedSound);
+        ma_audio_buffer_uninit(&decompressedBuffer);
+    }
+    // --- End Miniaudio Cleanup ---
     ma_engine_uninit(&engine);
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
