@@ -5,7 +5,30 @@
 #include <GLFW/glfw3.h>
 #include <string>
 #include "compressor.h"
+#include <fstream>
 
+// Helper to save our bitstream to a physical file
+bool SaveBitstreamToFile(const std::string& originalWavPath, const std::vector<uint8_t>& bitstream) {
+    if (bitstream.empty()) return false;
+
+    // Create a new filename (e.g., "song.wav" becomes "song.wav.bin")
+    std::string outputPath = originalWavPath + ".bin";
+
+    // Open an output file stream in strictly BINARY mode
+    std::ofstream outFile(outputPath, std::ios::binary);
+    
+    if (!outFile.is_open()) {
+        printf("ERROR: Could not open file for writing!\n");
+        return false;
+    }
+
+    // Dump the raw vector memory directly to the hard drive
+    outFile.write(reinterpret_cast<const char*>(bitstream.data()), bitstream.size());
+    outFile.close();
+    
+    printf("Successfully exported to: %s\n", outputPath.c_str());
+    return true;
+}
 // Helper to open a native Ubuntu file dialog
 std::string OpenWavFileDialog() {
     char filename[1024];
@@ -26,6 +49,35 @@ std::string OpenWavFileDialog() {
 // Helper to catch and print GLFW errors
 static void glfw_error_callback(int error, const char* description) {
     fprintf(stderr, "GLFW Error %d: %s\n", error, description);
+}
+
+/// Professional Audacity-style waveform generator
+void GenerateWaveformForUI(const std::vector<int16_t>& sourceAudio, std::vector<float>& destUIBuffer) {
+    destUIBuffer.clear();
+    if (sourceAudio.empty()) return;
+
+    int targetUiPoints = 800; // Physical screen pixels
+    size_t chunkSize = sourceAudio.size() / targetUiPoints;
+    if (chunkSize == 0) chunkSize = 1;
+
+    for (size_t i = 0; i < sourceAudio.size(); i += chunkSize) {
+        int16_t maxVal = -32768;
+        int16_t minVal = 32767;
+
+        // Scan the entire chunk to guarantee we NEVER miss a loud peak
+        size_t endIdx = std::min(i + chunkSize, sourceAudio.size());
+        for (size_t j = i; j < endIdx; ++j) {
+            if (sourceAudio[j] > maxVal) maxVal = sourceAudio[j];
+            if (sourceAudio[j] < minVal) minVal = sourceAudio[j];
+        }
+
+        // We push the absolute maximum peak found in this chunk.
+        // (For a truly perfect ImGui plot, you'd plot both min and max, 
+        // but taking the largest absolute value gives a great envelope overview).
+        int16_t absolutePeak = std::max(std::abs(maxVal), std::abs(minVal));
+        
+        destUIBuffer.push_back((float)absolutePeak / 32768.0f);
+    }
 }
 
 int main(int, char**) {
@@ -60,8 +112,15 @@ int main(int, char**) {
     unsigned int audioSampleRate = 0;
     unsigned int audioChannels = 0;
 
+    // --- UI Visualization Buffers ---
+    std::vector<float> uiOriginalWave;
+    std::vector<float> uiDecompressedWave;
+    std::vector<float> uiResidualWave;
+
     // --- Compression State Variables ---
+// --- Compression State Variables ---
     std::vector<int16_t> decompressedAudioData;
+    std::vector<uint8_t> lastCompressedBitstream;
     std::string verificationStatus = "N/A";
     double calculatedRatio = 0.0;
     double calculatedRuntime = 0.0;
@@ -150,7 +209,8 @@ int main(int, char**) {
                 // 1. Run the compression engine
                 CompressionResult result = CompressAudio(loadedAudioData, audioChannels);
                 calculatedRuntime = result.runtimeMs;
-
+                
+                lastCompressedBitstream = result.compressedData;
                 // 2. Immediately decompress to test it 
                 decompressedAudioData = DecompressAudio(result.compressedData, loadedAudioData.size(), audioChannels);
                 // 3. Verify bit-perfect reconstruction
@@ -167,8 +227,6 @@ int main(int, char**) {
             } else {
                 verificationStatus = "ERROR: Load a WAV first!";
             }
-
-            // --- NEW: Load Decompressed Data into Audio Engine ---
             
             // Clean up old sound if you click the button multiple times
             if (isDecompressedSoundLoaded) {
@@ -196,9 +254,33 @@ int main(int, char**) {
             } else {
                 verificationStatus = "ERROR: Failed to load decompressed audio into engine!";
             }
+
+            GenerateWaveformForUI(loadedAudioData, uiOriginalWave);
+            GenerateWaveformForUI(decompressedAudioData, uiDecompressedWave);
+            
+            // To show the residuals, we can temporarily calculate them just for the UI
+            std::vector<int16_t> tempResiduals = CalculateResiduals(loadedAudioData, audioChannels);
+            GenerateWaveformForUI(tempResiduals, uiResidualWave);
         }
 
+        // --- Export File ---
+        ImGui::Separator();
         
+        // Only enable the button if we actually have compressed data in memory
+        if (lastCompressedBitstream.empty()) {
+            ImGui::BeginDisabled();
+        }
+        
+        if (ImGui::Button("Export to .bin File", ImVec2(200, 30))) {
+            bool success = SaveBitstreamToFile(selectedFilePath, lastCompressedBitstream);
+            if (success) {
+                verificationStatus = "Exported Successfully!";
+            }
+        }
+        
+        if (lastCompressedBitstream.empty()) {
+            ImGui::EndDisabled();
+        }
 
         ImGui::Text("Compression Size: %.2f%% of original", calculatedRatio);
         ImGui::Text("Runtime: %.3f ms", calculatedRuntime);
@@ -259,6 +341,28 @@ int main(int, char**) {
                     ma_sound_start(&decompressedSound);
                 }
             }
+        }
+
+        // --- Waveform Visualizer ---
+        ImGui::Separator();
+        ImGui::Text("Audio Data Visualization:");
+
+        if (!uiOriginalWave.empty() && !uiDecompressedWave.empty()) {
+            // Draw Original Wave
+            ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "Original Audio");
+            ImGui::PlotLines("##Orig", uiOriginalWave.data(), uiOriginalWave.size(), 0, NULL, -1.0f, 1.0f, ImVec2(0, 80));
+
+            // Draw Decompressed Wave
+            ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "Decompressed Audio (Identical)");
+            ImGui::PlotLines("##Decomp", uiDecompressedWave.data(), uiDecompressedWave.size(), 0, NULL, -1.0f, 1.0f, ImVec2(0, 80));
+
+            // Draw Residuals (The actual data being compressed)
+            if (!uiResidualWave.empty()) {
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Prediction Residuals (What is actually Rice Coded)");
+                ImGui::PlotLines("##Resid", uiResidualWave.data(), uiResidualWave.size(), 0, NULL, -1.0f, 1.0f, ImVec2(0, 80));
+            }
+        } else {
+            ImGui::TextDisabled("Load and compress a file to see waveforms...");
         }
 
         ImGui::End();
