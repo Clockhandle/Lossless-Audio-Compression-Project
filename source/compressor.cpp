@@ -163,24 +163,20 @@ std::vector<int16_t> ReconstructAudio(const std::vector<int16_t>& residuals, int
     return reconstructed;
 }
 
-// --- Optimal K Finder ---
-int FindOptimalK(const std::vector<int16_t>& residuals) {
+int FindOptimalK(const std::vector<int16_t>& residuals, size_t start, size_t end) {
     int bestK = 8;
-    uint64_t minBits = UINT64_MAX; // Start with the maximum possible number
+    uint64_t minBits = UINT64_MAX; 
 
-    // Test K values between 4 and 14 (standard range for audio)
     for (int k = 4; k <= 14; ++k) {
         uint64_t totalBits = 0;
         
-        for (int16_t res : residuals) {
-            uint16_t mapped = ZigZagEncode(res);
+        // Only loop through THIS specific frame's samples
+        for (size_t i = start; i < end; ++i) {
+            uint16_t mapped = ZigZagEncode(residuals[i]);
             uint16_t q = mapped >> k;
-            
-            // Unary length is 'q' 1s + one '0'. Binary remainder is 'k' bits.
             totalBits += (q + 1) + k; 
         }
         
-        // If this K takes fewer bits, it's our new winner
         if (totalBits < minBits) {
             minBits = totalBits;
             bestK = k;
@@ -191,29 +187,36 @@ int FindOptimalK(const std::vector<int16_t>& residuals) {
 }
 
 CompressionResult CompressAudio(const std::vector<int16_t>& rawAudio, int numChannels) {
-    auto start = std::chrono::high_resolution_clock::now();
+    auto start_time = std::chrono::high_resolution_clock::now();
 
-    // 1. Prediction Phase
+    // 1. Prediction Phase (Global)
     std::vector<int16_t> residuals = CalculateResiduals(rawAudio, numChannels);
 
-    // 2. Find the mathematically perfect K for this specific audio
-    int optimalK = FindOptimalK(residuals);
-
-    // 3. Entropy Phase
+    // 2. Entropy Phase (Framed)
     BitWriter writer;
-    
-    // IMPORTANT: Write the winning K into the first 8 bits of the file!
-    // This acts as a mini-header so the decoder knows how to read it.
-    writer.WriteBits(optimalK, 8); 
+    const size_t FRAME_SIZE = 4096; // Standard FLAC block size
 
-    for (size_t i = 0; i < residuals.size(); ++i) {
-        EncodeRice(writer, residuals[i], optimalK);
+    // Step through the audio in 4096-sample chunks
+    for (size_t i = 0; i < residuals.size(); i += FRAME_SIZE) {
+        // Prevent out-of-bounds on the very last chunk
+        size_t endIdx = std::min(i + FRAME_SIZE, residuals.size());
+
+        // Find the mathematically perfect K for THIS specific frame
+        int optimalK = FindOptimalK(residuals, i, endIdx);
+
+        // Frame Header: Write the winning K into the bitstream (8 bits)
+        writer.WriteBits(optimalK, 8); 
+
+        // Frame Payload: Encode just the samples in this block
+        for (size_t j = i; j < endIdx; ++j) {
+            EncodeRice(writer, residuals[j], optimalK);
+        }
     }
     
     writer.Flush();
 
-    auto stop = std::chrono::high_resolution_clock::now();
-    double runtime = std::chrono::duration<double, std::milli>(stop - start).count();
+    auto stop_time = std::chrono::high_resolution_clock::now();
+    double runtime = std::chrono::duration<double, std::milli>(stop_time - start_time).count();
 
     return {writer.buffer, runtime};
 }
@@ -224,10 +227,20 @@ std::vector<int16_t> DecompressAudio(const std::vector<uint8_t>& compressedData,
     std::vector<int16_t> decodedResiduals;
     decodedResiduals.reserve(expectedSamples);
 
-    int optimalK = reader.ReadBits(8);
-    // Decode exactly the number of samples we expect
-    for (size_t i = 0; i < expectedSamples; ++i) {
-        decodedResiduals.push_back(DecodeRice(reader, optimalK));
+    const size_t FRAME_SIZE = 4096;
+
+    // Step through the expected audio in 4096-sample chunks
+    for (size_t i = 0; i < expectedSamples; i += FRAME_SIZE) {
+        // Prevent out-of-bounds on the very last chunk
+        size_t endIdx = std::min(i + FRAME_SIZE, expectedSamples);
+
+        // Frame Header: Read the first 8 bits to find the K-value for this frame
+        int optimalK = reader.ReadBits(8);
+
+        // Frame Payload: Decode the samples for this block
+        for (size_t j = i; j < endIdx; ++j) {
+            decodedResiduals.push_back(DecodeRice(reader, optimalK));
+        }
     }
 
     // Run the inverse prediction to get the original PCM back
