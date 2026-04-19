@@ -60,6 +60,12 @@ int main(int, char**) {
     unsigned int audioSampleRate = 0;
     unsigned int audioChannels = 0;
 
+    // --- Compression State Variables ---
+    std::vector<int16_t> decompressedAudioData;
+    std::string verificationStatus = "N/A";
+    double calculatedRatio = 0.0;
+    double calculatedRuntime = 0.0;
+    
     // --- Miniaudio Setup ---
     ma_engine engine;
     ma_result result = ma_engine_init(NULL, &engine);
@@ -87,66 +93,98 @@ int main(int, char**) {
         ImGui::Separator();
 
         // --- File Input ---
-    if (ImGui::Button("Select WAV File")) {
-        std::string newPath = OpenWavFileDialog();
-        
-        if (!newPath.empty()) {
-            selectedFilePath = newPath;
+        if (ImGui::Button("Select WAV File")) {
+            std::string newPath = OpenWavFileDialog();
             
-            // --- dr_wav Loading Logic ---
-            unsigned int channels;
-            unsigned int sampleRate;
-            drwav_uint64 totalPCMFrameCount;
-            
-            // Decode the audio into 16-bit PCM format
-            int16_t* pSampleData = drwav_open_file_and_read_pcm_frames_s16(
-                selectedFilePath.c_str(), &channels, &sampleRate, &totalPCMFrameCount, NULL);
+            if (!newPath.empty()) {
+                selectedFilePath = newPath;
                 
-            if (pSampleData == NULL) {
-                selectedFilePath = "ERROR: Failed to load WAV!";
-            } else {
-                // Copy the raw C-array into our safe C++ std::vector
-                loadedAudioData.assign(pSampleData, pSampleData + (totalPCMFrameCount * channels));
-                audioSampleRate = sampleRate;
-                audioChannels = channels;
+                // --- dr_wav Loading Logic ---
+                unsigned int channels;
+                unsigned int sampleRate;
+                drwav_uint64 totalPCMFrameCount;
                 
-                if (isOriginalSoundLoaded) {
-                    ma_sound_uninit(&originalSound); // Clean up previous file
-                    isOriginalSoundLoaded = false;
+                // Decode the audio into 16-bit PCM format
+                int16_t* pSampleData = drwav_open_file_and_read_pcm_frames_s16(
+                    selectedFilePath.c_str(), &channels, &sampleRate, &totalPCMFrameCount, NULL);
+                    
+                if (pSampleData == NULL) {
+                    selectedFilePath = "ERROR: Failed to load WAV!";
+                } else {
+                    // Copy the raw C-array into our safe C++ std::vector
+                    loadedAudioData.assign(pSampleData, pSampleData + (totalPCMFrameCount * channels));
+                    audioSampleRate = sampleRate;
+                    audioChannels = channels;
+                    
+                    if (isOriginalSoundLoaded) {
+                        ma_sound_uninit(&originalSound); // Clean up previous file
+                        isOriginalSoundLoaded = false;
+                    }
+                    
+                    if (ma_sound_init_from_file(&engine, selectedFilePath.c_str(), 0, NULL, NULL, &originalSound) == MA_SUCCESS) {
+                        isOriginalSoundLoaded = true;
+                    }
+                    
+                    drwav_free(pSampleData, NULL);
                 }
-                
-                if (ma_sound_init_from_file(&engine, selectedFilePath.c_str(), 0, NULL, NULL, &originalSound) == MA_SUCCESS) {
-                    isOriginalSoundLoaded = true;
-                }
-                
-                drwav_free(pSampleData, NULL);
             }
         }
-    }
-    
-    ImGui::SameLine();
-    ImGui::Text("%s", selectedFilePath.c_str());
-    
-    // Optional: Show some stats to prove it loaded!
-    if (!loadedAudioData.empty()) {
-        ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), 
-            "Loaded: %zu samples | %d Hz | %d Channels", 
-            loadedAudioData.size(), audioSampleRate, audioChannels);
-    }
-
-        // Execution
-        if (ImGui::Button("Compress & Verify Live", ImVec2(200, 30))) {
-            // Math logic goes here
+        
+        ImGui::SameLine();
+        ImGui::Text("%s", selectedFilePath.c_str());
+        
+        // Optional: Show some stats to prove it loaded!
+        if (!loadedAudioData.empty()) {
+            ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), 
+                "Loaded: %zu samples | %d Hz | %d Channels", 
+                loadedAudioData.size(), audioSampleRate, audioChannels);
         }
+
+        // --- Execution ---
+        if (ImGui::Button("Compress & Verify Live", ImVec2(200, 30))) {
+            if (!loadedAudioData.empty()) {
+                // 1. Run the compression engine
+                CompressionResult result = CompressAudio(loadedAudioData);
+                calculatedRuntime = result.runtimeMs;
+
+                // 2. Immediately decompress to test it
+                decompressedAudioData = DecompressAudio(result.compressedData);
+
+                // 3. Verify bit-perfect reconstruction
+                bool isLossless = VerifyBitPerfect(loadedAudioData, decompressedAudioData);
+                verificationStatus = isLossless ? "PASS (Bit-Perfect)" : "FAIL";
+
+                // 4. Calculate Compression Ratio (Original Bytes vs Compressed Bytes)
+                size_t originalBytes = loadedAudioData.size() * sizeof(int16_t);
+                size_t compressedBytes = result.compressedData.size();
+                
+                if (originalBytes > 0) {
+                    calculatedRatio = (double)compressedBytes / originalBytes * 100.0;
+                }
+            } else {
+                verificationStatus = "ERROR: Load a WAV first!";
+            }
+        }
+
+        
+
+        ImGui::Text("Compression Size: %.2f%% of original", calculatedRatio);
+        ImGui::Text("Runtime: %.3f ms", calculatedRuntime);
 
         ImGui::Spacing();
         ImGui::Separator();
 
-        // Metrics Dashboard
+        /// --- Metrics Dashboard ---
         ImGui::Text("System Verification:");
-        ImGui::Text("Status: N/A");
-        ImGui::Text("Compression Ratio: N/A");
-        ImGui::Text("Runtime: N/A ms");
+        
+        // Color-coded status
+        if (verificationStatus.find("PASS") != std::string::npos) {
+            ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Status: %s", verificationStatus.c_str());
+        } else if (verificationStatus.find("FAIL") != std::string::npos || verificationStatus.find("ERROR") != std::string::npos) {
+            ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "Status: %s", verificationStatus.c_str());
+        } else {
+            ImGui::Text("Status: %s", verificationStatus.c_str());
+        }
 
         ImGui::Spacing();
         ImGui::Separator();
