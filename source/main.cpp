@@ -148,8 +148,7 @@ int main(int, char**) {
                 calculatedRuntime = result.runtimeMs;
 
                 // 2. Immediately decompress to test it
-                decompressedAudioData = DecompressAudio(result.compressedData);
-
+                decompressedAudioData = DecompressAudio(result.compressedData, loadedAudioData.size());
                 // 3. Verify bit-perfect reconstruction
                 bool isLossless = VerifyBitPerfect(loadedAudioData, decompressedAudioData);
                 verificationStatus = isLossless ? "PASS (Bit-Perfect)" : "FAIL";
