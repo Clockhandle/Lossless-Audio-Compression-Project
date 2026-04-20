@@ -1,0 +1,3 @@
+/home/clockhandle/Lossless_Audio_Compression_Project/build/CMakeFiles/Lossless_Audio_Compression_Project.dir
+/home/clockhandle/Lossless_Audio_Compression_Project/build/CMakeFiles/edit_cache.dir
+/home/clockhandle/Lossless_Audio_Compression_Project/build/CMakeFiles/rebuild_cache.dir
